@@ -12,7 +12,6 @@ if __name__ == "__main__":
 
     featured_df = pd.read_csv("./temp/final_featured_data.csv")
 
-    # 筛选出需要用来预测的最新一天的数据，即4月25日
     latest_date = featured_df['Date'].max()
     print(f"正在为日期 {latest_date} 的数据，预测下一个交易日的涨跌幅...")
     predict_df = featured_df[featured_df['Date'] == latest_date].copy()
@@ -22,7 +21,6 @@ if __name__ == "__main__":
 
     X_pred = predict_df[feature_cols]
 
-    # 对预测数据中可能存在的NaN进行最后一次填充
     X_pred.fillna(0, inplace=True)
 
     predictions = model.predict(X_pred)

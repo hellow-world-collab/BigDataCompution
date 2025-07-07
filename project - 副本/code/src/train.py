@@ -52,10 +52,8 @@ if __name__ == "__main__":
 
     data = pd.read_csv("./temp/final_featured_data.csv")
 
-    # 关键：只使用有Target的数据进行训练和验证
     trainable_data = data.dropna(subset=['Target']).copy()
 
-    # 黄金验证策略
     val_start_date = '2025-04-21'
     train_set = trainable_data[trainable_data['Date'] < val_start_date]
     val_set = trainable_data[trainable_data['Date'] >= val_start_date]

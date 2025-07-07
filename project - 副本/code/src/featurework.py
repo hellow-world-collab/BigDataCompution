@@ -8,9 +8,9 @@ def generate_final_features(df):
     """为LightGBM生成最终的、包含截面排序的高级特征集"""
     print("开始生成最终版高级特征...")
 
-    # --- 使用您指定的2024年之后的数据窗口 ---
+    # --- 使用3年的数据窗口 ---
     df['Date'] = pd.to_datetime(df['Date'])
-    cutoff_date = pd.to_datetime('2024-01-01')
+    cutoff_date = df['Date'].max() - pd.DateOffset(years=2)
     df = df[df['Date'] >= cutoff_date].copy()
     print(f"数据已筛选，只使用 {cutoff_date.date()} 之后的数据...")
 
