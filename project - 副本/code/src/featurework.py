@@ -1,60 +1,65 @@
 import pandas as pd
+import numpy as np
+from ta.momentum import RSIIndicator
+import pickle
 
 
-def inputdata(path):
-    data = pd.read_csv(path, header=0, sep=",", encoding="utf-8")
-    return data
+def generate_final_features(df):
+    """为LightGBM生成最终的、包含截面排序的高级特征集"""
+    print("开始生成最终版高级特征...")
 
+    # --- 使用您指定的2024年之后的数据窗口 ---
+    df['Date'] = pd.to_datetime(df['Date'])
+    cutoff_date = pd.to_datetime('2024-01-01')
+    df = df[df['Date'] >= cutoff_date].copy()
+    print(f"数据已筛选，只使用 {cutoff_date.date()} 之后的数据...")
 
-def outputdata(path, data, is_index=False):
-    data.to_csv(path, index=is_index, header=True, sep=",", mode="w", encoding="utf-8")
+    df.sort_values(by=['Date', 'StockCode'], inplace=True)
 
+    # --- 核心修复：使用标准的shift方法定义目标变量，确保方向正确 ---
+    # 先计算当日收益率，再向上移动一位，得到未来1日的收益率
+    df['return_1d'] = df.groupby('StockCode')['Close'].pct_change()
+    df['Target'] = df.groupby('StockCode')['return_1d'].shift(-1)
 
-def transcolname(df, column_mapping):
-    df.rename(columns=column_mapping, inplace=True)
+    # --- 特征工程 ---
+    # 类别1: 时序特征
+    for lag in [1, 2, 3, 5, 10, 21]:
+        df[f'return_lag_{lag}'] = df.groupby('StockCode')['return_1d'].shift(lag)
+
+    df['volatility_21'] = df.groupby('StockCode')['return_1d'].transform(lambda x: x.rolling(21).std())
+    df['rsi'] = df.groupby('StockCode')['Close'].transform(lambda x: RSIIndicator(close=x, fillna=True).rsi())
+
+    # 类别2: 截面特征 (精髓)
+    date_groups = df.groupby('Date')
+    df['rank_return_1d'] = date_groups['return_1d'].rank(pct=True)
+    df['rank_volatility_21'] = date_groups['volatility_21'].rank(pct=True)
+    df['rank_rsi'] = date_groups['rsi'].rank(pct=True)
+
+    # --- 数据清洗 ---
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # 保存完整的特征集，训练时再dropna
+    df.reset_index(drop=True, inplace=True)
+
     return df
 
 
-def trans_datetime(df):
-    ret_df = pd.DataFrame()
-    dt = df["Date"]
-    ret_df["year"] = dt.transform(lambda x: int(x.split("-")[0]))
-    ret_df["month"] = dt.transform(lambda x: int(x.split("-")[1]))
-    ret_df["day"] = dt.transform(lambda x: int(x.split("-")[2][:2]))
-    df = pd.concat([df, ret_df], axis=1)
-    unique_dates = pd.Series(df["Date"].unique()).sort_values().reset_index(drop=True)
-    date_mapping = {date: rank + 1 for rank, date in enumerate(unique_dates)}
-    df["Date"] = df["Date"].map(date_mapping)
-    # df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d")
-    # minTime = df["Date"].min()
-    # df["Date"] = ((df["Date"] - minTime) / pd.Timedelta(days=1)).astype(int)
-    return df
+if __name__ == "__main__":
+    train_df = pd.read_csv("./data/train.csv")
+    test_df = pd.read_csv("./data/test.csv")
 
+    combined_df = pd.concat([train_df, test_df]).drop_duplicates(subset=['股票代码', '日期'])
+    column_mapping = {"股票代码": "StockCode", "日期": "Date", "收盘": "Close"}
+    combined_df = combined_df.rename(columns=column_mapping)
 
-def processing_feature():
-    # 读取数据
-    data = inputdata("./data/train.csv")
-    column_mapping = {
-        "股票代码": "StockCode",
-        "日期": "Date",
-        "开盘": "Open",
-        "收盘": "Close",
-        "最高": "High",
-        "最低": "Low",
-        "成交量": "Volume",
-        "成交额": "Turnover",
-        "振幅": "Amplitude",
-        "涨跌额": "PriceChange",
-        "换手率": "TurnoverRate",
-        "涨跌幅": "PriceChangePercentage",
-    }
-    data = transcolname(data, column_mapping)
-    data.drop(columns=["PriceChangePercentage"], inplace=True)
-    data = trans_datetime(data)
+    featured_df = generate_final_features(combined_df)
 
-    return data
+    final_feature_cols = [col for col in featured_df.columns if col not in ['StockCode', 'Date', 'Target', 'Close']]
 
+    outputdata_path = "./temp/final_featured_data.csv"
+    featured_df.to_csv(outputdata_path, index=False)
 
-feature = processing_feature()
+    with open('./model/final_proc_info.pkl', 'wb') as f:
+        pickle.dump({'feature_cols': final_feature_cols}, f)
 
-outputdata("./temp/feature.csv", feature)
+    print(f"最终特征工程完成，生成 {len(final_feature_cols)} 个特征。数据已保存。")
