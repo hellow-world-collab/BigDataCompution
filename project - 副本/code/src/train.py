@@ -1,90 +1,125 @@
+# code/sre/train.py
+
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
 import pickle
-from scipy.stats import spearmanr
+import os
+import optuna
+from sklearn.model_selection import GroupKFold
+from config import *  # 导入所有配置
 
 
-def competition_score_metric(y_true, y_pred):
-    """自定义LightGBM评估函数，计算比赛的最终得分"""
-    df = pd.DataFrame({'true': y_true, 'pred': y_pred}).reset_index(drop=True)
+def create_flattened_features(df, window_size, feature_cols):
+    """将时序数据展平"""
+    lagged_dfs = []
+    for lag in range(1, window_size + 1):
+        shifted = df[feature_cols].shift(lag)
+        shifted.columns = [f'{col}_lag_{lag}' for col in feature_cols]
+        lagged_dfs.append(shifted)
 
-    df.sort_values(by='pred', ascending=False, inplace=True)
-    pred_top10 = set(df.index[:10])
-    pred_bottom10 = set(df.index[-10:])
-
-    df.sort_values(by='true', ascending=False, inplace=True)
-    true_top10 = set(df.index[:10])
-    true_bottom10 = set(df.index[-10:])
-
-    precision_up = len(pred_top10.intersection(true_top10)) / 10
-    f1_up = 2 * precision_up ** 2 / (2 * precision_up) if precision_up > 0 else 0
-
-    precision_down = len(pred_bottom10.intersection(true_bottom10)) / 10
-    f1_down = 2 * precision_down ** 2 / (2 * precision_down) if precision_down > 0 else 0
-
-    common_top = list(pred_top10.intersection(true_top10))
-    rank_corr_up = 0
-    if len(common_top) > 1:
-        pred_rank_up = df.loc[common_top].sort_values(by='pred', ascending=False).index.to_series().rank()
-        true_rank_up = df.loc[common_top].sort_values(by='true', ascending=False).index.to_series().rank()
-        corr, _ = spearmanr(pred_rank_up, true_rank_up)
-        rank_corr_up = corr if not np.isnan(corr) else 0
-
-    common_bottom = list(pred_bottom10.intersection(true_bottom10))
-    rank_corr_down = 0
-    if len(common_bottom) > 1:
-        pred_rank_down = df.loc[common_bottom].sort_values(by='pred', ascending=True).index.to_series().rank()
-        true_rank_down = df.loc[common_bottom].sort_values(by='true', ascending=True).index.to_series().rank()
-        corr, _ = spearmanr(pred_rank_down, true_rank_down)
-        rank_corr_down = corr if not np.isnan(corr) else 0
-
-    final_score = 0.2 * f1_up + 0.2 * f1_down + 0.3 * rank_corr_up + 0.3 * rank_corr_down
-    return 'competition_score', final_score, True
+    flattened_df = pd.concat(lagged_dfs, axis=1)
+    final_df = pd.concat([df[['StockCode', 'date_id', 'label']], flattened_df], axis=1)
+    return final_df
 
 
-if __name__ == "__main__":
-    print("开始使用LightGBM模型进行训练（使用最终比赛评分标准进行验证）...")
+def objective(trial, model_name, X_train, y_train, X_val, y_val):
+    """Optuna的目标函数"""
+    if model_name == 'lgbm':
+        params = {
+            'objective': 'regression_l1', 'metric': 'mae', 'n_estimators': 2000,
+            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 1e-1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
+            'lambda_l1': trial.suggest_float('lambda_l1', 1e-2, 10.0, log=True),
+            'lambda_l2': trial.suggest_float('lambda_l2', 1e-2, 10.0, log=True),
+            'verbose': -1, 'n_jobs': -1, 'seed': 42,
+        }
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(50, verbose=False)])
 
-    with open('./model/final_proc_info.pkl', 'rb') as f:
-        proc_info = pickle.load(f)
-        feature_cols = proc_info['feature_cols']
+    elif model_name == 'xgb':
+        params = {
+            'objective': 'reg:squarederror', 'eval_metric': 'mae', 'n_estimators': 2000,
+            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 1e-1, log=True),
+            'max_depth': trial.suggest_int('max_depth', 3, 9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'n_jobs': -1, 'seed': 42,
+        }
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
 
-    data = pd.read_csv("./temp/final_featured_data.csv")
+    preds = model.predict(X_val)
+    mae = np.mean(np.abs(preds - y_val))
+    return mae
 
-    trainable_data = data.dropna(subset=['Target']).copy()
 
-    val_start_date = '2025-04-21'
-    train_set = trainable_data[trainable_data['Date'] < val_start_date]
-    val_set = trainable_data[trainable_data['Date'] >= val_start_date]
+def train_all_models():
+    """主训练函数"""
+    print("--- Step 2: Running Ultimate Model Training ---")
 
-    X_train, y_train = train_set[feature_cols], train_set['Target']
-    X_val, y_val = val_set[feature_cols], val_set['Target']
+    # 1. 加载基础特征
+    base_feature_path = os.path.join(TEMP_DIR, 'base_features.csv')
+    df_base = pd.read_csv(base_feature_path)
 
-    print(f"训练集大小: {len(X_train)}, 验证集大小: {len(X_val)}")
+    # 2. 创建展平特征
+    print(f"Creating flattened features with window size {TIME_WINDOW_SIZE}...")
+    all_stocks_flattened = [create_flattened_features(group, TIME_WINDOW_SIZE, FLATTEN_COLS) for _, group in
+                            df_base.groupby('StockCode')]
+    df_model = pd.concat(all_stocks_flattened).dropna()
 
-    params = {'objective': 'regression_l1', 'n_estimators': 2000, 'learning_rate': 0.01,
-              'feature_fraction': 0.7, 'bagging_fraction': 0.7, 'num_leaves': 16,
-              'verbose': -1, 'n_jobs': -1, 'seed': 42}
+    # 3. 交叉验证与模型训练循环
+    features = [col for col in df_model.columns if col not in ['StockCode', 'date_id', 'label']]
+    X, y = df_model[features], df_model['label']
 
-    model = lgb.LGBMRegressor(**params)
+    # 使用GroupKFold确保同一天的所有股票都在同一个折叠里，防止数据泄露
+    gkf = GroupKFold(n_splits=CV_FOLDS)
 
-    model.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
-              eval_metric=competition_score_metric,
-              callbacks=[lgb.early_stopping(100, verbose=True)])
+    for model_name, config in MODELS_TO_TRAIN.items():
+        print(f"\n--- Training model: {model_name} ---")
 
-    print("\n在全部可训练数据上重新训练最终模型...")
-    best_iteration = model.best_iteration_ if model.best_iteration_ else 200
-    final_params = params.copy()
-    final_params['n_estimators'] = best_iteration
+        for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=df_model['date_id'])):
+            print(f"--- Fold {fold + 1}/{CV_FOLDS} ---")
+            X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+            X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
 
-    final_train_data = trainable_data[trainable_data['Date'] < '2025-04-25']
-    final_model = lgb.LGBMRegressor(**final_params)
-    final_model.fit(final_train_data[feature_cols], final_train_data['Target'])
+            best_params = config['default_params']
+            best_iteration = 2000
 
-    model_path = "./model/final_lgbm_model.pkl"
-    with open(model_path, 'wb') as f:
-        pickle.dump(final_model, f)
+            # 4. 超参数优化 (如果开启)
+            if OPTUNA_TRIALS > 0:
+                print(f"Running Optuna HPO for {OPTUNA_TRIALS} trials...")
+                study = optuna.create_study(direction='minimize')
+                study.optimize(lambda trial: objective(trial, model_name, X_train, y_train, X_val, y_val),
+                               n_trials=OPTUNA_TRIALS)
+                best_params.update(study.best_params)
+                print(f"Best MAE for fold {fold + 1}: {study.best_value:.5f}")
 
-    print(f"最终模型训练完成（使用 {best_iteration} 轮迭代），已保存到 {model_path}")
+            # 5. 使用最佳参数重新训练并保存模型
+            print("Retraining model with best parameters on fold data...")
+            if model_name == 'lgbm':
+                model = lgb.LGBMRegressor(**best_params)
+                model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                          callbacks=[lgb.early_stopping(100, verbose=False)])
+                best_iteration = model.best_iteration_
+            elif model_name == 'xgb':
+                model = xgb.XGBRegressor(**best_params)
+                model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=100, verbose=False)
+                best_iteration = model.best_iteration
+
+            # 为了预测时使用，我们用完整的fold数据重新训练
+            model.set_params(n_estimators=best_iteration)
+            model.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            model_path = os.path.join(MODEL_DIR, f'{model_name}_fold_{fold}.pkl')
+            with open(model_path, 'wb') as f:
+                pickle.dump(model, f)
+            print(f"Model saved to {model_path}")
+
+
+if __name__ == '__main__':
+    train_all_models()

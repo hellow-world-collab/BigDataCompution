@@ -1,44 +1,80 @@
+# code/sre/test.py
+
 import pandas as pd
+import numpy as np
 import pickle
+import os
+import glob
+from config import *  # 导入所有配置
 
-if __name__ == "__main__":
-    print("开始使用最终模型进行预测...")
 
-    with open('./model/final_proc_info.pkl', 'rb') as f:
-        proc_info = pickle.load(f)
-        feature_cols = proc_info['feature_cols']
+def final_ensemble_prediction():
+    """
+    使用所有训练好的模型进行模型融合预测。
+    """
+    print("--- Step 3: Running Final Ensemble Prediction for April 28 ---")
 
-    model = pickle.load(open("./model/final_lgbm_model.pkl", 'rb'))
+    # 1. 加载基础特征数据
+    base_feature_path = os.path.join(TEMP_DIR, 'base_features.csv')
+    df_base = pd.read_csv(base_feature_path)
 
-    featured_df = pd.read_csv("./temp/final_featured_data.csv")
+    # 2. 准备预测输入
+    print(f"Preparing input data using a {TIME_WINDOW_SIZE}-day window...")
+    prediction_inputs = []
+    stock_codes_for_prediction = []
 
-    latest_date = featured_df['Date'].max()
-    print(f"正在为日期 {latest_date} 的数据，预测下一个交易日的涨跌幅...")
-    predict_df = featured_df[featured_df['Date'] == latest_date].copy()
+    for code, group in df_base.groupby('StockCode'):
+        if len(group) < TIME_WINDOW_SIZE:
+            continue
 
-    if len(predict_df) == 0:
-        raise ValueError(f"错误：在特征数据中找不到日期为 {latest_date} 的数据用于预测。")
+        prediction_window = group.tail(TIME_WINDOW_SIZE)
+        flattened_features = []
+        for lag in range(1, TIME_WINDOW_SIZE + 1):
+            day_data = prediction_window[FLATTEN_COLS].tail(lag).iloc[0]
+            flattened_features.extend(day_data.values)
 
-    X_pred = predict_df[feature_cols]
+        prediction_inputs.append(flattened_features)
+        stock_codes_for_prediction.append(code)
 
-    X_pred.fillna(0, inplace=True)
+    feature_names = [f'{col}_lag_{lag}' for lag in range(1, TIME_WINDOW_SIZE + 1) for col in FLATTEN_COLS]
+    X_predict = pd.DataFrame(prediction_inputs, columns=feature_names)
 
-    predictions = model.predict(X_pred)
+    # 3. 加载所有模型并进行预测
+    all_predictions = []
+    model_files = glob.glob(os.path.join(MODEL_DIR, '*.pkl'))
 
-    result = pd.DataFrame({
-        'StockCode': predict_df['StockCode'],
-        'predicted_return': predictions
-    })
+    if not model_files:
+        print("Error: No trained models found in `model` directory. Please run `train.py` first.")
+        return
 
-    result.sort_values(by='predicted_return', ascending=False, inplace=True)
+    print(f"Found {len(model_files)} models for ensembling...")
+    for model_path in model_files:
+        print(f"  > Predicting with {os.path.basename(model_path)}")
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        preds = model.predict(X_predict)
+        all_predictions.append(preds)
 
-    pred_top_10_max_target = result['StockCode'].head(10).tolist()
-    pred_top_10_min_target = result['StockCode'].tail(10).tolist()
+    # 4. 融合预测 (取平均)
+    ensemble_predictions = np.mean(all_predictions, axis=0)
 
-    submission = pd.DataFrame({
-        "涨幅最大股票代码": pred_top_10_max_target,
-        "涨幅最小股票代码": pred_top_10_min_target,
-    })
+    # 5. 结果展示
+    print("\n" + "=" * 60)
+    print("      ENSEMBLE PREDICTION RESULTS FOR MONDAY, APRIL 28")
+    print("=" * 60)
 
-    submission.to_csv("./output/result.csv", index=False, encoding='utf-8')
-    print("预测完成，结果已保存到 ./output/result.csv")
+    results_df = pd.DataFrame({
+        'StockCode': stock_codes_for_prediction,
+        'Predicted_Change_Pct': ensemble_predictions
+    }).sort_values(by='Predicted_Change_Pct', ascending=False)
+
+    print("\n--- Top 10 Stocks with HIGHEST Predicted Price Change ---")
+    print(results_df.head(10).to_string(index=False))
+
+    print("\n--- Top 10 Stocks with LOWEST Predicted Price Change ---")
+    print(results_df.tail(10).sort_values(by='Predicted_Change_Pct').to_string(index=False))
+    print("\n" + "=" * 60 + "\n")
+
+
+if __name__ == '__main__':
+    final_ensemble_prediction()
